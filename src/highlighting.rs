@@ -19,6 +19,15 @@ impl SyntaxHighlighter {
         }
     }
 
+    /// Creates a new SyntaxHighlighter from existing SyntaxSet and ThemeSet instances.
+    /// Useful for loading custom syntaxes or themes.
+    pub fn from_sets(syntax_set: SyntaxSet, theme_set: ThemeSet) -> Self {
+        Self {
+            syntax_set: Arc::new(syntax_set),
+            theme_set: Arc::new(theme_set),
+        }
+    }
+
     /// Finds a syntax definition by its name (e.g., "Rust").
     pub fn find_syntax_by_name(&self, name: &str) -> Option<&SyntaxReference> {
         self.syntax_set.find_syntax_by_name(name)
