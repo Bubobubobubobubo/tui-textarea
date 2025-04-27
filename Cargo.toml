@@ -46,6 +46,7 @@ termwiz = { version = "0.22.0", optional = true }
 tui = { version = "0.19", default-features = false, optional = true }
 unicode-width = "0.2.0"
 serde = { version = "1", optional = true , features = ["derive"] }
+syntect = "5.2.0"
 
 [[example]]
 name = "minimal"

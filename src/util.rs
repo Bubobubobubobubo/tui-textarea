@@ -7,7 +7,7 @@ pub fn num_digits(i: usize) -> u8 {
     f64::log10(i as f64) as u8 + 1
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct Pos {
     pub row: usize,
     pub col: usize,

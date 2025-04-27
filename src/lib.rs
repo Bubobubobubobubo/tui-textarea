@@ -19,6 +19,8 @@ mod util;
 mod widget;
 mod word;
 
+mod highlighting;
+
 #[cfg(feature = "ratatui")]
 #[allow(clippy::single_component_path_imports)]
 use ratatui;
@@ -41,3 +43,4 @@ pub use cursor::CursorMove;
 pub use input::{Input, Key};
 pub use scroll::Scrolling;
 pub use textarea::TextArea;
+pub use highlighting::SyntaxHighlighter;

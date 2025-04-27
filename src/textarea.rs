@@ -1,23 +1,24 @@
 use crate::cursor::CursorMove;
-use crate::highlight::LineHighlighter;
 use crate::history::{Edit, EditKind, History};
+use crate::highlighting::{syntect_style_to_ratatui, SyntaxHighlighter};
 use crate::input::{Input, Key};
 use crate::ratatui::layout::Alignment;
 use crate::ratatui::style::{Color, Modifier, Style};
+use crate::ratatui::text::{Line, Span};
 use crate::ratatui::widgets::{Block, Widget};
 use crate::scroll::Scrolling;
 #[cfg(feature = "search")]
 use crate::search::Search;
+#[cfg(feature = "search")]
+use regex;
 use crate::util::{spaces, Pos};
 use crate::widget::Viewport;
 use crate::word::{find_word_exclusive_end_forward, find_word_start_backward};
-#[cfg(feature = "ratatui")]
-use ratatui::text::Line;
 use std::cmp::Ordering;
 use std::fmt;
-#[cfg(feature = "tuirs")]
-use tui::text::Spans as Line;
-use unicode_width::UnicodeWidthChar as _;
+use std::iter::repeat;
+use syntect::easy::HighlightLines;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Debug, Clone)]
 enum YankText {
@@ -125,6 +126,9 @@ pub struct TextArea<'a> {
     mask: Option<char>,
     selection_start: Option<(usize, usize)>,
     select_style: Style,
+    syntax_highlighter: Option<SyntaxHighlighter>,
+    syntax_name: Option<String>,
+    theme_name: Option<String>,
 }
 
 /// Convert any iterator whose elements can be converted into [`String`] into [`TextArea`]. Each [`String`] element is
@@ -230,6 +234,9 @@ impl<'a> TextArea<'a> {
             mask: None,
             selection_start: None,
             select_style: Style::default().bg(Color::LightBlue),
+            syntax_highlighter: None,
+            syntax_name: None,
+            theme_name: None,
         }
     }
 
@@ -1587,32 +1594,222 @@ impl<'a> TextArea<'a> {
     }
 
     pub(crate) fn line_spans<'b>(&'b self, line: &'b str, row: usize, lnum_len: u8) -> Line<'b> {
-        let mut hl = LineHighlighter::new(
-            line,
-            self.cursor_style,
-            self.tab_len,
-            self.mask,
-            self.select_style,
-        );
-
-        if let Some(style) = self.line_number_style {
-            hl.line_number(row, lnum_len, style);
+        // Handle cursor on empty line explicitly
+        if line.is_empty() && row == self.cursor.0 && self.cursor.1 == 0 {
+            let mut spans = vec![Span::styled(" ", self.cursor_style)];
+            if let Some(lnum_style) = self.line_number_style {
+                let lnum = format!(" {:width$} ", row + 1, width = lnum_len as usize);
+                spans.insert(0, Span::styled(lnum, lnum_style));
+            }
+            return Line::from(spans);
         }
 
-        if row == self.cursor.0 {
-            hl.cursor_line(self.cursor.1, self.cursor_line_style);
+        let expanded_line = self.expand_tabs(line);
+
+        // Perform syntax highlighting (if enabled)
+        let mut base_spans: Vec<Span<'b>> = if let (
+            Some(highlighter),
+            Some(syntax_name),
+            Some(theme_name)
+        ) = (
+            self.syntax_highlighter.as_ref(),
+            self.syntax_name.as_ref(),
+            self.theme_name.as_ref(),
+        ) {
+             if let (Some(syntax), Some(theme)) = (
+                highlighter.find_syntax_by_name(syntax_name),
+                highlighter.get_theme(theme_name),
+            ) {
+                let mut h = HighlightLines::new(syntax, theme);
+                match h.highlight_line(line, &highlighter.syntax_set) {
+                    Ok(ranges) => ranges
+                        .into_iter()
+                        .map(|(style, content)| {
+                            let ratatui_style = syntect_style_to_ratatui(style);
+                            Span::styled(self.expand_tabs(content), ratatui_style)
+                        })
+                        .collect(),
+                    Err(_) => vec![Span::raw(expanded_line.clone())],
+                }
+            } else {
+                vec![Span::raw(expanded_line.clone())]
+            }
+        } else {
+            vec![Span::raw(expanded_line.clone())]
+        };
+
+        // Apply Masking (if enabled)
+        if let Some(mask_char) = self.mask {
+            let mask_str = mask_char.to_string();
+            for span in &mut base_spans {
+                let span_char_count = span.content.chars().count();
+                span.content = repeat(mask_str.as_str()).take(span_char_count).collect::<String>().into();
+                span.style = self.style.patch(span.style);
+            }
+        } else {
+            for span in &mut base_spans {
+                 span.style = self.style.patch(span.style);
+            }
         }
 
-        #[cfg(feature = "search")]
-        if let Some(matches) = self.search.matches(line) {
-            hl.search(matches, self.search.style);
+        // Apply other styles by patching over base_spans
+        let mut spans_with_range: Vec<(usize, usize, Span)> = Vec::with_capacity(base_spans.len());
+        let mut total_width = 0;
+        for span in base_spans {
+            let span_width = span.width();
+            let start_width_idx = total_width;
+            total_width += span_width;
+            let end_width_idx = total_width;
+            spans_with_range.push((start_width_idx, end_width_idx, span));
+        }
+        let line_total_width = total_width;
+
+        let cursor_col = self.cursor.1;
+        let selection = self.selection_positions();
+        let mut patched_spans: Vec<Span<'b>> = Vec::with_capacity(spans_with_range.len());
+
+        let mut expanded_cursor_width_offset = None;
+        let mut expanded_selection_width_range: Option<(usize, usize)> = None;
+
+        let mut current_orig_col = 0;
+        let mut current_width = 0;
+        for c in line.chars() {
+            let char_width = if c == '\t' {
+                self.tab_len as usize - (current_width % self.tab_len as usize)
+            } else {
+                c.width().unwrap_or(0)
+            };
+
+            if row == self.cursor.0 && current_orig_col == cursor_col {
+                expanded_cursor_width_offset = Some(current_width);
+            }
+
+            if let Some((start_pos, end_pos)) = selection {
+                let sel_start_match = start_pos.row < row || (start_pos.row == row && current_orig_col >= start_pos.col);
+                let sel_end_match = end_pos.row > row || (end_pos.row == row && current_orig_col < end_pos.col);
+
+                if sel_start_match && sel_end_match {
+                    match expanded_selection_width_range {
+                        None => expanded_selection_width_range = Some((current_width, current_width + char_width)),
+                        Some((start, _)) => expanded_selection_width_range = Some((start, current_width + char_width)),
+                    }
+                }
+            }
+
+            current_orig_col += 1;
+            current_width += char_width;
+        }
+        if row == self.cursor.0 && current_orig_col == cursor_col {
+            expanded_cursor_width_offset = Some(current_width);
+        }
+        if let Some((start_pos, end_pos)) = selection {
+             if (start_pos.row < row || (start_pos.row == row && current_orig_col >= start_pos.col)) &&
+                (end_pos.row > row || (end_pos.row == row && current_orig_col == end_pos.col))
+             {
+                 match expanded_selection_width_range {
+                     None => expanded_selection_width_range = Some((current_width, current_width)),
+                     Some((start, _)) => expanded_selection_width_range = Some((start, current_width)),
+                 }
+             }
         }
 
-        if let Some((start, end)) = self.selection_positions() {
-            hl.selection(row, start.row, start.offset, end.row, end.offset);
+        for (span_start_width, span_end_width, mut span) in spans_with_range {
+            let mut is_cursor_span = false;
+
+            // Apply search highlights
+            #[cfg(feature = "search")]
+            if let Some(re) = &self.search.pat {
+                for m in re.find_iter(&expanded_line) {
+                    let match_start_byte = m.start();
+                    let match_end_byte = m.end();
+                    let match_start_width = expanded_line[..match_start_byte].width();
+                    let match_end_width = match_start_width + expanded_line[match_start_byte..match_end_byte].width();
+                    if match_start_width < span_end_width && match_end_width > span_start_width {
+                        span.style = span.style.patch(self.search.style);
+                    }
+                }
+            }
+
+            // Apply selection highlight
+            if let Some((sel_start_width, sel_end_width)) = expanded_selection_width_range {
+                if sel_start_width < span_end_width && sel_end_width > span_start_width {
+                    span.style = span.style.patch(self.select_style);
+                }
+            }
+
+            // Apply cursor line style
+            if row == self.cursor.0 {
+                span.style = span.style.patch(self.cursor_line_style);
+            }
+
+            // Check if cursor falls within this span and split if necessary
+            if row == self.cursor.0 {
+                if let Some(exp_cursor_width) = expanded_cursor_width_offset {
+                    if exp_cursor_width >= span_start_width && exp_cursor_width < span_end_width {
+                        is_cursor_span = true;
+                        let mut current_span_width = 0;
+                        let mut target_byte_offset = 0;
+                        let mut target_char_len = 0;
+                        let mut char_idx_in_span = 0;
+                        for (char_i, (byte_offset, c)) in span.content.char_indices().enumerate() {
+                             let char_width = c.width().unwrap_or(0);
+                             let char_start_width_in_span = current_span_width;
+                             let char_end_width_in_span = current_span_width + char_width;
+                             current_span_width = char_end_width_in_span;
+                             if exp_cursor_width >= (span_start_width + char_start_width_in_span)
+                                 && exp_cursor_width < (span_start_width + char_end_width_in_span)
+                             {
+                                 target_byte_offset = byte_offset;
+                                 target_char_len = c.len_utf8();
+                                 char_idx_in_span = char_i;
+                                 break;
+                             }
+                        }
+
+                        // Split the span content and clone slices into owned Strings
+                        let content_str = span.content.as_ref(); 
+                        let before_cursor = &content_str[..target_byte_offset];
+                        let cursor_char_str = &content_str[target_byte_offset..target_byte_offset + target_char_len];
+                        let after_cursor = &content_str[target_byte_offset + target_char_len..];
+
+                        if !before_cursor.is_empty() {
+                            patched_spans.push(Span::styled(String::from(before_cursor), span.style)); // Clone slice
+                        }
+                        patched_spans.push(Span::styled(String::from(cursor_char_str), self.cursor_style)); // Clone slice
+                        if !after_cursor.is_empty() {
+                            patched_spans.push(Span::styled(String::from(after_cursor), span.style)); // Clone slice
+                        }
+
+                    } else if exp_cursor_width == line_total_width && span_end_width == line_total_width {
+                        is_cursor_span = true;
+                        let content_str = span.content.as_ref();
+                        if let Some((last_char_idx, _)) = content_str.char_indices().last() {
+                            let before_last = &content_str[..last_char_idx];
+                            let last_char_str = &content_str[last_char_idx..];
+                            if !before_last.is_empty() {
+                                 patched_spans.push(Span::styled(String::from(before_last), span.style)); // Clone slice
+                            }
+                             patched_spans.push(Span::styled(String::from(last_char_str), self.cursor_style)); // Clone slice
+                        } else {
+                             patched_spans.push(Span::styled(String::from(" "), self.cursor_style)); // Clone space
+                        }
+                    }
+                }
+            }
+
+            // If the cursor was not in this span, push a clone of the original span
+            if !is_cursor_span {
+                 patched_spans.push(span.clone()); // Clone the span
+            }
         }
 
-        hl.into_spans()
+        // Prepend line number
+        if let Some(lnum_style) = self.line_number_style {
+            let lnum = format!(" {:width$} ", row + 1, width = lnum_len as usize);
+            patched_spans.insert(0, Span::styled(lnum, lnum_style));
+        }
+
+        Line::from(patched_spans)
     }
 
     /// Build a ratatui (or tui-rs) widget to render the current state of the textarea. The widget instance returned
@@ -2400,6 +2597,61 @@ impl<'a> TextArea<'a> {
         scrolling.scroll(&mut self.viewport);
         self.move_cursor_with_shift(CursorMove::InViewport, shift);
     }
+
+    /// Expands tabs in a line to spaces according to tab_len.
+    fn expand_tabs(&self, line: &str) -> String {
+        if self.tab_len == 0 || !line.contains('\t') {
+            return line.to_string();
+        }
+        let mut expanded = String::with_capacity(line.len() + self.tab_len as usize * 4); // Preallocate a bit
+        let mut width = 0;
+        for ch in line.chars() {
+            if ch == '\t' {
+                let spaces_to_add = self.tab_len as usize - (width % self.tab_len as usize);
+                expanded.push_str(&spaces(spaces_to_add as u8));
+                width += spaces_to_add;
+            } else {
+                expanded.push(ch);
+                width += ch.width().unwrap_or(0);
+            }
+        }
+        expanded
+    }
+
+    // --- Syntax Highlighting Methods --- ADD THIS BLOCK BACK ---
+
+    /// Sets the [`SyntaxHighlighter`] instance containing the necessary syntax and theme sets.
+    /// This is required to enable syntax highlighting.
+    pub fn set_syntax_highlighter(&mut self, highlighter: SyntaxHighlighter) {
+        self.syntax_highlighter = Some(highlighter);
+    }
+
+    /// Sets the name of the syntax definition to use (e.g., "Rust", "Python").
+    /// Requires `set_syntax_highlighter` to have been called.
+    /// Setting `None` disables syntax highlighting for this textarea.
+    pub fn set_syntax(&mut self, name: Option<String>) {
+        self.syntax_name = name;
+        if self.syntax_name.is_none() {
+            // If syntax is disabled, theme doesn't make sense either
+            self.theme_name = None;
+        }
+    }
+
+    /// Sets the name of the theme to use (e.g., "base16-ocean.dark").
+    /// Requires `set_syntax_highlighter` and `set_syntax` to have been called with non-None values.
+    pub fn set_theme(&mut self, name: Option<String>) {
+        self.theme_name = name;
+    }
+
+    /// Disables syntax highlighting by removing the highlighter, syntax name, and theme name.
+    pub fn clear_syntax_highlighting(&mut self) {
+        self.syntax_highlighter = None;
+        self.syntax_name = None;
+        self.theme_name = None;
+    }
+
+    // --- End Syntax Highlighting Methods ---
+
 }
 
 #[cfg(test)]
