@@ -1775,24 +1775,21 @@ impl<'a> TextArea<'a> {
                         if !before_cursor.is_empty() {
                             patched_spans.push(Span::styled(String::from(before_cursor), span.style)); // Clone slice
                         }
-                        patched_spans.push(Span::styled(String::from(cursor_char_str), self.cursor_style)); // Clone slice
+                        // Apply cursor style directly to the character under the cursor (block cursor)
+                        patched_spans.push(Span::styled(String::from(cursor_char_str), self.cursor_style)); // Clone slice & apply style
                         if !after_cursor.is_empty() {
                             patched_spans.push(Span::styled(String::from(after_cursor), span.style)); // Clone slice
                         }
 
+                    // Correctly handle cursor at the end of the line
                     } else if exp_cursor_width == line_total_width && span_end_width == line_total_width {
                         is_cursor_span = true;
-                        let content_str = span.content.as_ref();
-                        if let Some((last_char_idx, _)) = content_str.char_indices().last() {
-                            let before_last = &content_str[..last_char_idx];
-                            let last_char_str = &content_str[last_char_idx..];
-                            if !before_last.is_empty() {
-                                 patched_spans.push(Span::styled(String::from(before_last), span.style)); // Clone slice
-                            }
-                             patched_spans.push(Span::styled(String::from(last_char_str), self.cursor_style)); // Clone slice
-                        } else {
-                             patched_spans.push(Span::styled(String::from(" "), self.cursor_style)); // Clone space
+                        // Push the original span content first
+                        if !span.content.is_empty() {
+                            patched_spans.push(span.clone()); // Clone the span
                         }
+                        // Then add the styled space for the cursor *after* the content
+                        patched_spans.push(Span::styled(String::from(" "), self.cursor_style)); // Clone space
                     }
                 }
             }
